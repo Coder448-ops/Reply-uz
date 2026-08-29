@@ -1,3 +1,4 @@
-aiogram>=3.0.0
-telethon>=1.30.0
-psycopg2-binary>=2.9.0
+aiogram
+telethon
+psycopg2-binary
+aiohttp
