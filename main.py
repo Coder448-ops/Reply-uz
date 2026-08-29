@@ -157,44 +157,40 @@ def is_user_logged_in(user_id: int) -> bool:
 async def start_auto_reply(user_id, client: TelegramClient):
     @client.on(events.NewMessage(incoming=True))
     async def auto_reply_handler(event):
+        # Faqat shaxsiy chatlardan kelgan va kiruvchi xabarlar uchun
         if not event.is_private or event.out:
             return
             
         sender = await event.get_sender()
+        # Agar yuboruvchi bot bo'lsa yoki o'zingiz bo'lsangiz e'tiborsiz qoldiramiz
         if not isinstance(sender, User) or sender.bot or sender.is_self:
             return
 
         chat_id = event.chat_id
+        incoming_msg_id = event.id
 
+        # 7 soniya kutamiz (foydalanuvchi o'zi javob yozishi uchun)
         await asyncio.sleep(7)
 
         try:
-            async for msg in client.iter_messages(chat_id, limit=3):
-                if msg.out:
+            # 7 soniyadan keyin chatdagi eng so'nggi xabarlarni olamiz
+            messages = await client.get_messages(chat_id, limit=5)
+            
+            # Agar siz (akkaunt egasi) 7 soniya ichida javob yozgan bo'lsangiz — to'xtaymiz
+            for msg in messages:
+                if msg.out and msg.id > incoming_msg_id:
+                    print(f"ℹ️ {sender.first_name} ga o'zingiz javob yozdingiz, avto-javob bekor qilindi.")
                     return
-        except Exception:
-            pass
 
-        try:
-            dialogs = await client.get_dialogs(limit=50)
-            target_dialog = None
-            for d in dialogs:
-                if d.entity.id == sender.id:
-                    target_dialog = d
-                    break
+            # Shaxsiy javob matnini olamiz
+            reply_text = get_custom_reply_text(user_id)
 
-            if target_dialog and target_dialog.unread_count == 0:
-                return
-        except Exception as e:
-            print(f"Dialog tekshirishda xato: {e}")
-
-        reply_text = get_custom_reply_text(user_id)
-
-        try:
+            # Javob yuboramiz
             await event.reply(reply_text)
-            print(f"📩 Avtomatik javob yuborildi (7s o'qilmadi): {sender.first_name}")
+            print(f"📩 Avtomatik javob yuborildi: {sender.first_name}")
+
         except Exception as e:
-            print(f"Xatolik (auto reply): {e}")
+            print(f"❌ Xatolik (auto reply): {e}")
 
     try:
         if not client.is_connected():
@@ -471,7 +467,7 @@ async def finish_login(user_id: int, client: TelegramClient, message: types.Mess
 
     await message.answer(
         "✅ Muvaffaqiyatli ulandi!\n"
-        "🤖 Endi 7 soniya ichida o'qilmagan xabarlarga avtomatik javob beriladi.",
+        "🤖 Endi 7 soniya ichida o'qilmagan va javob berilmagan xabarlarga avtomatik javob beriladi.",
         reply_markup=get_main_keyboard(True)
     )
 
