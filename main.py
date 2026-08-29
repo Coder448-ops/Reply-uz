@@ -1,8 +1,7 @@
 import os
 import asyncio
-import sqlite3
+import psycopg2
 import sys
-from dotenv import load_dotenv, set_key
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, KeyboardButton, ReplyKeyboardMarkup
@@ -18,14 +17,13 @@ from telethon.errors import (
 )
 from telethon.tl.types import User
 
-DB_NAME = 'user_sessions.db'
-ENV_FILE = '.env'
 DEFAULT_REPLY_TEXT = "Kechirasiz, hozircha bandman. Kelishim bilan javob beraman.\n(Avtomatik javob)"
 
 # ========== GLOBAL SOZLAMALAR ==========
 API_ID = None
 API_HASH = None
 BOT_TOKEN = None
+DATABASE_URL = None
 
 bot: Bot = None
 dp = Dispatcher()
@@ -38,103 +36,78 @@ phone_cache = {}           # user_id -> phone
 phone_code_hash_cache = {} # user_id -> phone_code_hash
 
 
-# ========== MA'LUMOTLARNI .ENV FAYLDAN OLISH YOKI SAQLASH ==========
-def load_or_get_credentials():
-    global API_ID, API_HASH, BOT_TOKEN
-
-    load_dotenv(ENV_FILE)
+# ========== ENVIRONMENT VARIABLES'DAN OLISH ==========
+def load_credentials():
+    global API_ID, API_HASH, BOT_TOKEN, DATABASE_URL
 
     API_ID = os.getenv("API_ID")
     API_HASH = os.getenv("API_HASH")
     BOT_TOKEN = os.getenv("BOT_TOKEN")
+    DATABASE_URL = os.getenv("DATABASE_URL")  # Choreo Postgres URL
 
-    if API_ID and API_HASH and BOT_TOKEN:
+    if not API_ID or not API_HASH or not BOT_TOKEN:
+        print("❌ XATOLIK: API_ID, API_HASH yoki BOT_TOKEN Choreo Environment Variables'da topilmadi!")
+        sys.exit(1)
+
+    if not DATABASE_URL:
+        print("❌ XATOLIK: DATABASE_URL topilmadi! Choreo Postgres bazasini ulashingiz kerak.")
+        sys.exit(1)
+
+    try:
         API_ID = int(API_ID)
-        print("=" * 50)
-        print("✅ Saqlangan sozlamalar (.env) muvaffaqiyatli yuklandi!")
-        print("=" * 50)
-        return
+    except ValueError:
+        print("❌ XATOLIK: API_ID faqat raqamlardan iborat bo'lishi kerak!")
+        sys.exit(1)
 
     print("=" * 50)
-    print("🤖 Birinchi marta ishga tushirish. Sozlamalarni kiriting:")
-    print("=" * 50)
-
-    while True:
-        api_id_input = input("👉 API_ID ni kiriting: ").strip()
-        if api_id_input.isdigit():
-            API_ID = int(api_id_input)
-            break
-        print("❌ API_ID faqat raqamlardan iborat bo'lishi kerak.")
-
-    while True:
-        api_hash_input = input("👉 API_HASH ni kiriting: ").strip()
-        if len(api_hash_input) > 10:
-            API_HASH = api_hash_input
-            break
-        print("❌ API_HASH noto'g'ri ko'rinadi.")
-
-    while True:
-        bot_token_input = input("👉 BOT_TOKEN ni kiriting: ").strip()
-        if ":" in bot_token_input and len(bot_token_input) > 20:
-            BOT_TOKEN = bot_token_input
-            break
-        print("❌ BOT_TOKEN noto'g'ri ko'rinadi.")
-
-    with open(ENV_FILE, "a", encoding="utf-8") as f:
-        pass
-
-    set_key(ENV_FILE, "API_ID", str(API_ID))
-    set_key(ENV_FILE, "API_HASH", str(API_HASH))
-    set_key(ENV_FILE, "BOT_TOKEN", str(BOT_TOKEN))
-
-    print("=" * 50)
-    print("✅ Ma'lumotlar .env fayliga saqlandi!")
+    print("✅ Environment Variables va DATABASE_URL yuklandi!")
     print("=" * 50)
 
 
-# ========== SQLITE FUNKSIYALARI ==========
+# ========== POSTGRESQL FUNKSIYALARI ==========
+def get_db_connection():
+    return psycopg2.connect(DATABASE_URL)
+
+
 def init_db():
-    conn = sqlite3.connect(DB_NAME)
+    conn = get_db_connection()
     c = conn.cursor()
-    c.execute('''CREATE TABLE IF NOT EXISTS sessions
-                 (user_id INTEGER PRIMARY KEY, session_string TEXT, custom_text TEXT)''')
-    
-    # Eski baza bo'lsa custom_text ustunini qo'shadi
-    c.execute("PRAGMA table_info(sessions)")
-    columns = [column[1] for column in c.fetchall()]
-    if 'custom_text' not in columns:
-        c.execute("ALTER TABLE sessions ADD COLUMN custom_text TEXT")
-        print("🛠️ Ma'lumotlar bazasiga 'custom_text' ustuni qo'shildi.")
-        
+    c.execute('''CREATE TABLE IF NOT EXISTS user_sessions
+                 (user_id BIGINT PRIMARY KEY, session_string TEXT, custom_text TEXT)''')
     conn.commit()
+    c.close()
     conn.close()
+    print("🛠️ PostgreSQL bazasi va jadval tayyor qilindi.")
 
 
 def save_session(user_id, session_string):
-    conn = sqlite3.connect(DB_NAME)
+    conn = get_db_connection()
     c = conn.cursor()
-    c.execute('''INSERT INTO sessions (user_id, session_string) VALUES (?, ?)
-                 ON CONFLICT(user_id) DO UPDATE SET session_string=excluded.session_string''', 
+    c.execute('''INSERT INTO user_sessions (user_id, session_string) VALUES (%s, %s)
+                 ON CONFLICT(user_id) DO UPDATE SET session_string = EXCLUDED.session_string''', 
               (user_id, session_string))
     conn.commit()
+    c.close()
     conn.close()
 
 
 def set_custom_reply_text(user_id, text):
-    conn = sqlite3.connect(DB_NAME)
+    conn = get_db_connection()
     c = conn.cursor()
-    c.execute('''INSERT INTO sessions (user_id, custom_text) VALUES (?, ?)
-                 ON CONFLICT(user_id) DO UPDATE SET custom_text=excluded.custom_text''', 
+    c.execute('''INSERT INTO user_sessions (user_id, custom_text) VALUES (%s, %s)
+                 ON CONFLICT(user_id) DO UPDATE SET custom_text = EXCLUDED.custom_text''', 
               (user_id, text))
     conn.commit()
+    c.close()
     conn.close()
 
 
 def get_custom_reply_text(user_id):
-    conn = sqlite3.connect(DB_NAME)
+    conn = get_db_connection()
     c = conn.cursor()
-    c.execute('SELECT custom_text FROM sessions WHERE user_id=?', (user_id,))
+    c.execute('SELECT custom_text FROM user_sessions WHERE user_id=%s', (user_id,))
     row = c.fetchone()
+    c.close()
     conn.close()
     if row and row[0]:
         return row[0]
@@ -142,28 +115,31 @@ def get_custom_reply_text(user_id):
 
 
 def get_session(user_id):
-    conn = sqlite3.connect(DB_NAME)
+    conn = get_db_connection()
     c = conn.cursor()
-    c.execute('SELECT session_string FROM sessions WHERE user_id=?', (user_id,))
+    c.execute('SELECT session_string FROM user_sessions WHERE user_id=%s', (user_id,))
     row = c.fetchone()
+    c.close()
     conn.close()
     return row[0] if row else None
 
 
 def get_all_sessions():
-    conn = sqlite3.connect(DB_NAME)
+    conn = get_db_connection()
     c = conn.cursor()
-    c.execute('SELECT user_id, session_string FROM sessions WHERE session_string IS NOT NULL')
+    c.execute('SELECT user_id, session_string FROM user_sessions WHERE session_string IS NOT NULL')
     rows = c.fetchall()
+    c.close()
     conn.close()
     return rows
 
 
 def delete_session(user_id):
-    conn = sqlite3.connect(DB_NAME)
+    conn = get_db_connection()
     c = conn.cursor()
-    c.execute('DELETE FROM sessions WHERE user_id=?', (user_id,))
+    c.execute('DELETE FROM user_sessions WHERE user_id=%s', (user_id,))
     conn.commit()
+    c.close()
     conn.close()
 
 
@@ -180,10 +156,8 @@ async def start_auto_reply(user_id, client: TelegramClient):
 
         chat_id = event.chat_id
 
-        # 1. 7 soniya kutamiz
         await asyncio.sleep(7)
 
-        # 2. Shu 7 soniya ichida o'zingiz chatga javob yozgan bo'lsangiz, avto-javob yuborilmaydi
         try:
             async for msg in client.iter_messages(chat_id, limit=3):
                 if msg.out:
@@ -191,7 +165,6 @@ async def start_auto_reply(user_id, client: TelegramClient):
         except Exception:
             pass
 
-        # 3. Chat dialog holatini tekshirish: unread_count 0 bo'lsa (o'qilgan bo'lsa) to'xtaymiz
         try:
             dialogs = await client.get_dialogs(limit=50)
             target_dialog = None
@@ -205,7 +178,6 @@ async def start_auto_reply(user_id, client: TelegramClient):
         except Exception as e:
             print(f"Dialog tekshirishda xato: {e}")
 
-        # 4. Hali ham o'qilmagan bo'lsa, foydalanuvchining shaxsiy matnini yuboramiz
         reply_text = get_custom_reply_text(user_id)
 
         try:
@@ -489,7 +461,7 @@ async def restore_sessions():
                 user_clients[user_id] = client
                 task = asyncio.create_task(start_auto_reply(user_id, client))
                 auto_tasks[user_id] = task
-                print(f"🔄 User {user_id} sessiyasi tiklandi.")
+                print(f"🔄 User {user_id} sessiyasi PostgreSQL'dan tiklandi.")
             else:
                 await client.disconnect()
                 delete_session(user_id)
@@ -503,7 +475,7 @@ async def restore_sessions():
 async def main():
     global bot
 
-    load_or_get_credentials()
+    load_credentials()
 
     bot = Bot(token=BOT_TOKEN)
 
