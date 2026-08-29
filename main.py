@@ -43,14 +43,14 @@ def load_credentials():
     API_ID = os.getenv("API_ID")
     API_HASH = os.getenv("API_HASH")
     BOT_TOKEN = os.getenv("BOT_TOKEN")
-    DATABASE_URL = os.getenv("DATABASE_URL")  # Choreo Postgres URL
+    DATABASE_URL = os.getenv("DATABASE_URL")
 
     if not API_ID or not API_HASH or not BOT_TOKEN:
-        print("❌ XATOLIK: API_ID, API_HASH yoki BOT_TOKEN Choreo Environment Variables'da topilmadi!")
+        print("❌ XATOLIK: API_ID, API_HASH yoki BOT_TOKEN topilmadi!")
         sys.exit(1)
 
     if not DATABASE_URL:
-        print("❌ XATOLIK: DATABASE_URL topilmadi! Choreo Postgres bazasini ulashingiz kerak.")
+        print("❌ XATOLIK: DATABASE_URL topilmadi!")
         sys.exit(1)
 
     try:
@@ -143,6 +143,15 @@ def delete_session(user_id):
     conn.close()
 
 
+# ========== TEKSHIRUV FUNKSIYASI ==========
+def is_user_logged_in(user_id: int) -> bool:
+    """Foydalanuvchi faol klientga ega yoki bazada saqlangan sessiyasi borligini tekshiradi."""
+    if user_id in user_clients and user_clients[user_id].is_connected():
+        return True
+    session_str = get_session(user_id)
+    return bool(session_str)
+
+
 # ========== AVTOMATIK JAVOB FUNKSIYASI ==========
 async def start_auto_reply(user_id, client: TelegramClient):
     @client.on(events.NewMessage(incoming=True))
@@ -231,15 +240,34 @@ def get_main_keyboard(is_connected=False):
 @dp.message(Command("start"))
 async def start_cmd(message: types.Message):
     user_id = message.from_user.id
-    is_connected = user_id in user_clients and user_clients[user_id].is_connected()
+    logged_in = is_user_logged_in(user_id)
     current_text = get_custom_reply_text(user_id)
+
+    # Agar bazada sessiyasi bo'lsa-yu, lekin xotirada klient faol bo'lmasa — qayta ulaymiz
+    if logged_in and user_id not in user_clients:
+        session_string = get_session(user_id)
+        if session_string:
+            try:
+                client = TelegramClient(StringSession(session_string), API_ID, API_HASH)
+                await client.connect()
+                if await client.is_user_authorized():
+                    user_clients[user_id] = client
+                    auto_tasks[user_id] = asyncio.create_task(start_auto_reply(user_id, client))
+                else:
+                    delete_session(user_id)
+                    logged_in = False
+            except Exception:
+                logged_in = False
+
+    status_text = "🟢 **Avto-javob faol holatda**" if logged_in else "🔴 **Avto-javob ulanmagan**"
 
     await message.answer(
         f"Assalomu alaykum! 👋\n\n"
+        f"Holat: {status_text}\n"
         f"💬 **Sizning joriy avto-javob matningiz:**\n`{current_text}`\n\n"
         f"Kerakli bo'limni tanlang:",
         parse_mode="Markdown",
-        reply_markup=get_main_keyboard(is_connected)
+        reply_markup=get_main_keyboard(logged_in)
     )
 
 
@@ -260,14 +288,28 @@ async def change_text_callback(callback: types.CallbackQuery):
 async def start_auto_callback(callback: types.CallbackQuery):
     user_id = callback.from_user.id
 
-    if user_id in user_clients and user_clients[user_id].is_connected():
-        await callback.message.edit_text(
-            "✅ Siz allaqachon ulangansiz. Avtomatik javob faol.",
-            reply_markup=get_main_keyboard(True)
-        )
-        await callback.answer()
-        return
+    # 1-tekshiruv: Xotirada yoki Bazada bor-yo'qligini tekshiramiz
+    session_string = get_session(user_id)
+    if session_string:
+        # Bazada sessiya bor bo'lsa, qayta telefon raqam so'ramasdan ulaymiz
+        try:
+            if user_id not in user_clients or not user_clients[user_id].is_connected():
+                client = TelegramClient(StringSession(session_string), API_ID, API_HASH)
+                await client.connect()
+                if await client.is_user_authorized():
+                    user_clients[user_id] = client
+                    auto_tasks[user_id] = asyncio.create_task(start_auto_reply(user_id, client))
+            
+            await callback.message.edit_text(
+                "✅ Siz allaqachon ro'yxatdan o'tgansiz va avto-javob faollashtirildi!",
+                reply_markup=get_main_keyboard(True)
+            )
+            await callback.answer()
+            return
+        except Exception as e:
+            delete_session(user_id)
 
+    # Agar foydalanuvchi mutlaqo yangi bo'lsa — raqam so'riladi
     keyboard = ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text="📱 Telefon raqamini ulashish", request_contact=True)]
@@ -344,16 +386,16 @@ async def handle_text_input(message: types.Message):
     if state == "custom_text":
         set_custom_reply_text(user_id, text)
         waiting_for[user_id] = None
-        is_connected = user_id in user_clients and user_clients[user_id].is_connected()
+        logged_in = is_user_logged_in(user_id)
         await message.answer(
             f"✅ **Sizning shaxsiy avto-javob matningiz saqlandi!**\n\n"
             f"📝 **Yangi matn:**\n`{text}`",
             parse_mode="Markdown",
-            reply_markup=get_main_keyboard(is_connected)
+            reply_markup=get_main_keyboard(logged_in)
         )
         return
 
-    if user_id in user_clients and user_clients[user_id].is_connected() and state is None:
+    if is_user_logged_in(user_id) and state is None:
         await message.answer("✅ Siz allaqachon ulangansiz.", reply_markup=get_main_keyboard(True))
         return
 
@@ -417,7 +459,7 @@ async def handle_text_input(message: types.Message):
             await message.answer(f"❌ Parol noto'g'ri: {e}. Qaytadan kiriting.")
 
     else:
-        await message.answer("❌ Iltimos, avval /start bosing.", reply_markup=get_main_keyboard(False))
+        await message.answer("❌ Iltimos, avval /start bosing.", reply_markup=get_main_keyboard(is_user_logged_in(user_id)))
 
 
 async def finish_login(user_id: int, client: TelegramClient, message: types.Message):
@@ -441,7 +483,7 @@ async def finish_login(user_id: int, client: TelegramClient, message: types.Mess
 async def stop_auto_callback(callback: types.CallbackQuery):
     user_id = callback.from_user.id
 
-    if user_id in user_clients or get_session(user_id):
+    if is_user_logged_in(user_id):
         stop_client_task(user_id)
         delete_session(user_id)
         waiting_for[user_id] = None
