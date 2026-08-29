@@ -2,6 +2,7 @@ import os
 import asyncio
 import psycopg2
 import sys
+from aiohttp import web
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, KeyboardButton, ReplyKeyboardMarkup
@@ -243,7 +244,6 @@ async def start_cmd(message: types.Message):
     logged_in = is_user_logged_in(user_id)
     current_text = get_custom_reply_text(user_id)
 
-    # Agar bazada sessiyasi bo'lsa-yu, lekin xotirada klient faol bo'lmasa — qayta ulaymiz
     if logged_in and user_id not in user_clients:
         session_string = get_session(user_id)
         if session_string:
@@ -288,10 +288,8 @@ async def change_text_callback(callback: types.CallbackQuery):
 async def start_auto_callback(callback: types.CallbackQuery):
     user_id = callback.from_user.id
 
-    # 1-tekshiruv: Xotirada yoki Bazada bor-yo'qligini tekshiramiz
     session_string = get_session(user_id)
     if session_string:
-        # Bazada sessiya bor bo'lsa, qayta telefon raqam so'ramasdan ulaymiz
         try:
             if user_id not in user_clients or not user_clients[user_id].is_connected():
                 client = TelegramClient(StringSession(session_string), API_ID, API_HASH)
@@ -306,10 +304,9 @@ async def start_auto_callback(callback: types.CallbackQuery):
             )
             await callback.answer()
             return
-        except Exception as e:
+        except Exception:
             delete_session(user_id)
 
-    # Agar foydalanuvchi mutlaqo yangi bo'lsa — raqam so'riladi
     keyboard = ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text="📱 Telefon raqamini ulashish", request_contact=True)]
@@ -513,6 +510,11 @@ async def restore_sessions():
             delete_session(user_id)
 
 
+# ========== BACK4APP HEALTH-CHECK SERVER ==========
+async def handle_health_check(request):
+    return web.Response(text="Bot is running and healthy!", status=200)
+
+
 # ========== BOTNI ISHGA TUSHIRISH ==========
 async def main():
     global bot
@@ -531,7 +533,21 @@ async def main():
     init_db()
     await restore_sessions()
 
-    print("🤖 Bot ishga tushdi...")
+    # Back4App taqdim etgan PORT o'zgaruvchisini olish (sukut bo'yicha 5000)
+    port = int(os.getenv("PORT", 5000))
+    
+    # Back4App Health Check uchun mini aiohttp server
+    app = web.Application()
+    app.router.add_get('/', handle_health_check)
+    app.router.add_get('/health', handle_health_check)
+    
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, '0.0.0.0', port)
+    await site.start()
+    print(f"🌐 Back4App Health-check server {port}-portda tinglamoqda...")
+
+    print("🤖 Bot polling rejimida ishga tushdi...")
     await dp.start_polling(bot)
 
 
