@@ -5,7 +5,10 @@ import time
 import os
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, KeyboardButton, ReplyKeyboardMarkup
+from aiogram.types import (
+    InlineKeyboardMarkup, InlineKeyboardButton, 
+    ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove
+)
 from aiogram import F
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
@@ -18,13 +21,13 @@ from telethon.errors import (
     UserDeactivatedBanError,
     UnauthorizedError
 )
-from aiohttp import web
 
 DB_NAME = 'user_sessions.db'
 DEFAULT_REPLY_TEXT = "Hozircha bandman, bo'shashim bilan aloqaga chiqaman."
 DEFAULT_DELAY = 7  
 
-# ========== SOZLAMALAR ==========
+# ========== ADMIN VA SOZLAMALAR ==========
+ADMIN_USERNAME = "neopulse_uz"
 API_ID = 37437082
 API_HASH = "b7d4fa4d28472bf3768a4cae5e3fd01c"
 BOT_TOKEN = "8995093768:AAEDCJ-yB2mxlQRhdKfLjO9VoogSM22lHdY"
@@ -42,7 +45,7 @@ phone_code_hash_cache = {}
 
 # ========== MA'LUMOTLAR BAZASI ==========
 def get_db():
-    conn = sqlite3.connect(DB_NAME, timeout=15)
+    conn = sqlite3.connect(DB_NAME, timeout=30)
     conn.execute("PRAGMA journal_mode=WAL;")
     return conn
 
@@ -105,6 +108,12 @@ def get_all_sessions():
         c.execute('SELECT user_id, session_string FROM sessions WHERE session_string IS NOT NULL')
         return c.fetchall()
 
+def get_total_users_count():
+    with get_db() as conn:
+        c = conn.cursor()
+        c.execute('SELECT COUNT(*) FROM sessions')
+        return c.fetchone()[0]
+
 def delete_session(user_id):
     with get_db() as conn:
         conn.execute('DELETE FROM sessions WHERE user_id=?', (user_id,))
@@ -154,6 +163,11 @@ def get_and_delete_all_sent_replies(user_id, chat_id):
             conn.commit()
             return [r[0] for r in rows]
         return []
+
+def is_admin(user: types.User) -> bool:
+    if user.username and user.username.lower() == ADMIN_USERNAME:
+        return True
+    return False
 
 
 # ========== TELETHON AVTO JAVOB FUNKSIYASI ==========
@@ -248,7 +262,7 @@ def stop_client_task(user_id):
     auto_tasks.pop(user_id, None)
 
 
-# ========== TUGMALAR VA BOT MENU ==========
+# ========== TUGMALAR VA MENYULAR ==========
 def get_main_keyboard(is_connected=False):
     buttons = []
     if is_connected:
@@ -261,11 +275,22 @@ def get_main_keyboard(is_connected=False):
         buttons.append([InlineKeyboardButton(text="🚀 Boshlash (Ulanish)", callback_data="start_auto")])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
+def get_reply_keyboard(user: types.User):
+    keyboard = []
+    if is_admin(user):
+        keyboard.append([KeyboardButton(text="👑 Admin Panel"), KeyboardButton(text="📊 Statistika")])
+        keyboard.append([KeyboardButton(text="📢 Xabar yuborish")])
+    
+    keyboard.append([KeyboardButton(text="⚙️ Sozlamalar / Bosh menyu")])
+    return ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True)
 
+
+# ========== START VA ADMIN BUYRUQLARI ==========
 @dp.message(Command("start"))
 async def start_cmd(message: types.Message):
     user_id = message.from_user.id
     is_connected = has_active_session(user_id)
+    reply_kb = get_reply_keyboard(message.from_user)
 
     if is_connected:
         current_text = get_custom_reply_text(user_id)
@@ -280,14 +305,56 @@ async def start_cmd(message: types.Message):
             parse_mode="HTML",
             reply_markup=get_main_keyboard(True)
         )
+        await message.answer("👇 Qulay boshqaruv menyusi:", reply_markup=reply_kb)
     else:
         await message.answer(
             "Assalomu alaykum! 👋\n\n"
             "Botdan foydalanish uchun Telegram akkauntingizni ulang.",
             reply_markup=get_main_keyboard(False)
         )
+        await message.answer("👇 Qulay boshqaruv menyusi:", reply_markup=reply_kb)
 
 
+@dp.message(F.text == "👑 Admin Panel")
+async def admin_panel_cmd(message: types.Message):
+    if not is_admin(message.from_user):
+        return
+    await message.answer(
+        "🛠 <b>Admin Panel</b>\n\n"
+        "Siz bot tizimida admin huquqiga egasiz.\n"
+        "Quyidagi tugmalar orqali botni boshqarishingiz mumkin:",
+        parse_mode="HTML"
+    )
+
+@dp.message(F.text == "📊 Statistika")
+async def admin_stats_cmd(message: types.Message):
+    if not is_admin(message.from_user):
+        return
+    total_users = get_total_users_count()
+    active_sessions = len(get_all_sessions())
+    
+    await message.answer(
+        f"📊 <b>Bot Statistikasi:</b>\n\n"
+        f"👥 Barcha foydalanuvchilar: <b>{total_users}</b>\n"
+        f"⚡️ Faol ulangan seanslar: <b>{active_sessions}</b>",
+        parse_mode="HTML"
+    )
+
+@dp.message(F.text == "📢 Xabar yuborish")
+async def admin_broadcast_cmd(message: types.Message):
+    if not is_admin(message.from_user):
+        return
+    waiting_for[message.from_user.id] = "admin_broadcast"
+    await message.answer("📝 Barcha foydalanuvchilarga yubormoqchi bo'lgan xabaringizni yozing:")
+
+@dp.message(F.text == "⚙️ Sozlamalar / Bosh menyu")
+async def settings_cmd(message: types.Message):
+    user_id = message.from_user.id
+    is_connected = has_active_session(user_id)
+    await message.answer("⚙️ <b>Bosh menyu va sozlamalar:</b>", parse_mode="HTML", reply_markup=get_main_keyboard(is_connected))
+
+
+# ========== CALLBACK VA MATN ISHLOVCHILARI ==========
 @dp.callback_query(F.data == "add_trigger")
 async def add_trigger_cb(callback: types.CallbackQuery):
     user_id = callback.from_user.id
@@ -380,7 +447,7 @@ async def request_code(user_id: int, phone: str, message: types.Message):
         await message.answer(
             "✅ Kod yuborildi!\n\n⚠️ Kodni ajratib yuboring (Masalan: <code>5-1-9-9-6</code>).",
             parse_mode="HTML",
-            reply_markup=types.ReplyKeyboardRemove()
+            reply_markup=ReplyKeyboardRemove()
         )
     except FloodWaitError as e:
         await message.answer(f"⏳ Telegram cheklovi! Biroz kuting: {e.seconds} soniya.")
@@ -407,6 +474,21 @@ async def handle_text_input(message: types.Message):
     user_id = message.from_user.id
     text = message.text
     state = waiting_for.get(user_id)
+
+    # Admin xabar yuborishi
+    if state == "admin_broadcast" and is_admin(message.from_user):
+        waiting_for[user_id] = None
+        users = get_all_sessions()
+        count = 0
+        for u_id, _ in users:
+            try:
+                await bot.send_message(u_id, text)
+                count += 1
+                await asyncio.sleep(0.05)
+            except Exception:
+                pass
+        await message.answer(f"✅ Xabar {count} ta foydalanuvchiga muvaffaqiyatli yuborildi.")
+        return
 
     if state == "trigger_keyword":
         waiting_for[user_id] = f"trigger_response:{text.strip()}"
@@ -497,10 +579,12 @@ async def finish_login(user_id: int, client: TelegramClient, message: types.Mess
     auto_tasks[user_id] = task
 
     delay = get_user_delay(user_id)
+    reply_kb = get_reply_keyboard(message.from_user)
     await message.answer(
         f"✅ Muvaffaqiyatli ulandi!\n🤖 Offline bo'lsangiz darhol, Online bo'lsangiz {delay} soniyada avto-javob yuboriladi va o'qilganida/javob berilganida o'chiriladi.",
         reply_markup=get_main_keyboard(True)
     )
+    await message.answer("👇 Qulay boshqaruv menyusi:", reply_markup=reply_kb)
 
 
 @dp.callback_query(F.data == "stop_auto")
@@ -535,32 +619,10 @@ async def restore_sessions():
         await asyncio.sleep(0.2)
 
 
-# ========== BACK4APP HEALTH CHECK WEB SERVER ==========
-async def handle_health_check(request):
-    return web.Response(text="OK", status=200)
-
-async def start_dummy_web_server():
-    app = web.Application()
-    app.router.add_get('/', handle_health_check)
-    app.router.add_get('/health', handle_health_check)
-    
-    port = int(os.environ.get("PORT", 5000))
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, '0.0.0.0', port)
-    await site.start()
-    print(f"🌐 Health check server {port}-portda ishga tushdi!")
-
-
 async def main():
     init_db()
     await restore_sessions()
-    
-    # Webhook to'zalash (TelegramConflictError bo'lmasligi uchun)
     await bot.delete_webhook(drop_pending_updates=True)
-    
-    # Back4app uchun 5000-portda dummy web-serverni yoqish
-    await start_dummy_web_server()
     
     print("🤖 Bot to'liq tayyor!")
     await dp.start_polling(bot)
