@@ -2,6 +2,7 @@ import asyncio
 import sqlite3
 import html
 import time
+import os
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, KeyboardButton, ReplyKeyboardMarkup
@@ -17,6 +18,7 @@ from telethon.errors import (
     UserDeactivatedBanError,
     UnauthorizedError
 )
+from aiohttp import web
 
 DB_NAME = 'user_sessions.db'
 DEFAULT_REPLY_TEXT = "Hozircha bandman, bo'shashim bilan aloqaga chiqaman."
@@ -156,8 +158,6 @@ def get_and_delete_all_sent_replies(user_id, chat_id):
 
 # ========== TELETHON AVTO JAVOB FUNKSIYASI ==========
 async def start_auto_reply(user_id, client: TelegramClient):
-    
-    # 1. KIRUVCHI XABAR (B-USER YOZGANDA)
     @client.on(events.NewMessage(incoming=True))
     async def auto_reply_handler(event):
         if not event.is_private or event.out:
@@ -192,7 +192,6 @@ async def start_auto_reply(user_id, client: TelegramClient):
         except Exception as e:
             print(f"Xatolik auto reply (user={user_id}): {e}")
 
-    # 2. CHIQUVCHI XABAR (A-USER JAVOB YOZSA O'CHIRISH)
     @client.on(events.NewMessage(outgoing=True))
     async def outgoing_handler(event):
         if not event.is_private:
@@ -206,7 +205,6 @@ async def start_auto_reply(user_id, client: TelegramClient):
         except Exception as e:
             print(f"Avto-javoblarni o'chirishda xatolik: {e}")
 
-    # 3. XABAR O'QILGANIDA (READED) O'CHIRISH
     @client.on(events.MessageRead(out=False))
     async def message_read_handler(event):
         try:
@@ -217,7 +215,6 @@ async def start_auto_reply(user_id, client: TelegramClient):
         except Exception as e:
             print(f"Read hodisasida avto-javoblarni o'chirishda xatolik: {e}")
 
-    # Auto-Reconnect sikli
     while True:
         try:
             if not client.is_connected():
@@ -268,7 +265,6 @@ def get_main_keyboard(is_connected=False):
 @dp.message(Command("start"))
 async def start_cmd(message: types.Message):
     user_id = message.from_user.id
-    
     is_connected = has_active_session(user_id)
 
     if is_connected:
@@ -539,12 +535,32 @@ async def restore_sessions():
         await asyncio.sleep(0.2)
 
 
+# ========== BACK4APP HEALTH CHECK WEB SERVER ==========
+async def handle_health_check(request):
+    return web.Response(text="OK", status=200)
+
+async def start_dummy_web_server():
+    app = web.Application()
+    app.router.add_get('/', handle_health_check)
+    app.router.add_get('/health', handle_health_check)
+    
+    port = int(os.environ.get("PORT", 5000))
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, '0.0.0.0', port)
+    await site.start()
+    print(f"🌐 Health check server {port}-portda ishga tushdi!")
+
+
 async def main():
     init_db()
     await restore_sessions()
     
-    # Back4app va Telegram serveridagi eski ulanishlarni to'zalash
+    # Webhook to'zalash (TelegramConflictError bo'lmasligi uchun)
     await bot.delete_webhook(drop_pending_updates=True)
+    
+    # Back4app uchun 5000-portda dummy web-serverni yoqish
+    await start_dummy_web_server()
     
     print("🤖 Bot to'liq tayyor!")
     await dp.start_polling(bot)
