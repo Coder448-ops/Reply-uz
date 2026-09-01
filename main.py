@@ -19,6 +19,7 @@ import html
 import json
 import time
 import re
+import io
 import traceback
 from datetime import datetime, timedelta
 
@@ -26,7 +27,8 @@ from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
 from aiogram.types import (
     InlineKeyboardMarkup, InlineKeyboardButton,
-    ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove
+    ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove,
+    BufferedInputFile
 )
 from aiogram import F
 from telethon import TelegramClient, events
@@ -45,6 +47,12 @@ from telethon.errors import (
 from deep_translator import GoogleTranslator
 from langdetect import detect, DetectorFactory
 DetectorFactory.seed = 0
+
+# ========== EKSPORT (Excel / Word) ==========
+import openpyxl
+from openpyxl.styles import Font, PatternFill, Alignment
+from docx import Document
+from docx.shared import Pt, RGBColor
 
 # ========== KONFIGURATSIYA ==========
 DB_NAME = 'user_sessions.db'
@@ -319,6 +327,11 @@ def get_bot_tag():
 def set_bot_tag(tag):
     set_config('bot_tag', tag)
 
+def dlog(*args):
+    """Konsolga log chiqarish — admin sozlamasiga qarab yoqiladi/o'chiriladi."""
+    if get_flag('debug_enabled', True):
+        print(*args)
+
 def reset_all_holiday_greetings():
     with get_db() as conn:
         c = conn.cursor()
@@ -329,19 +342,22 @@ def reset_all_holiday_greetings():
 
 # ========== HOLIDAY FUNKSIYALARI ==========
 def get_holiday_info():
+    """Bugungi bayram uchun (matn, nom). Matn admin panelidan o'zgartirilishi mumkin."""
     today = datetime.now()
     month_day = today.strftime("%m-%d")
     holidays = {
-        "01-01": ("🎉 Yangi Yil muborak!", "new_year"),
-        "03-21": ("🌿 Navro'z muborak!", "navruz"),
-        "09-01": ("🇺🇿 Mustaqillik kuni muborak!", "independence_day"),
-        "10-01": ("🇺🇿 O'qituvchi va murabbiylar kuni!", "teachers_day"),
-        "12-08": ("🇺🇿 Konstitutsiya kuni!", "constitution_day"),
+        "01-01": ("holiday_text_new_year",      "🎉 Yangi Yil muborak!", "new_year"),
+        "03-21": ("holiday_text_navruz",        "🌿 Navro'z muborak!", "navruz"),
+        "09-01": ("holiday_text_independence",  "🇺🇿 Mustaqillik kuni muborak!", "independence_day"),
+        "10-01": ("holiday_text_teacher",       "🇺🇿 O'qituvchi va murabbiylar kuni!", "teachers_day"),
+        "12-08": ("holiday_text_constitution",  "🇺🇿 Konstitutsiya kuni!", "constitution_day"),
     }
     if (today.month == 8 and today.day >= 29) or (today.month == 9 and today.day == 1):
-        return ("🇺🇿 Mustaqillik kuni muborak!", "independence_day")
+        cfg_key, default, name = holidays["09-01"]
+        return (get_config(cfg_key, default), name)
     if month_day in holidays:
-        return holidays[month_day]
+        cfg_key, default, name = holidays[month_day]
+        return (get_config(cfg_key, default), name)
     return None, None
 
 def has_user_received_holiday(user_id, holiday_name):
@@ -437,10 +453,101 @@ def get_logs_last_2h(user_id):
     cutoff = datetime.now() - timedelta(hours=2)
     return [e for e in chat_log_cache[user_id] if e['timestamp'] >= cutoff]
 
+# ========== EKSPORT (Excel / Word) ==========
+def collect_user_data():
+    """Barcha foydalanuvchilar ma'lumotini list-of-dict qilib to'playdi."""
+    default_delay = get_global_default_delay()
+    default_text = get_global_default_text()
+    rows = []
+    with get_db() as conn:
+        c = conn.cursor()
+        c.execute('SELECT user_id, session_string, custom_text, delay_seconds FROM sessions')
+        for uid, sess, ctext, delay in c.fetchall():
+            trig = get_user_triggers(uid)
+            rows.append({
+                'id': uid,
+                'text': ctext if ctext else default_text,
+                'delay': delay if (delay is not None and delay >= 0) else default_delay,
+                'triggers': len(trig),
+                'session': bool(sess),
+                'running': uid in user_clients,
+                'blocked': is_blocked(uid),
+            })
+    return rows
+
+def build_excel_bytes(rows):
+    from openpyxl.utils import get_column_letter
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Foydalanuvchilar"
+    headers = ["ID", "Javob matni", "Kechikish (s)", "Triggerlar",
+               "Ulangan seans", "Faol jarayon", "Bloklangan"]
+    ws.append(headers)
+    for c in ws[1]:
+        c.font = Font(bold=True, color="FFFFFF")
+        c.fill = PatternFill("solid", fgColor="305496")
+        c.alignment = Alignment(horizontal="center")
+    for r in rows:
+        ws.append([
+            r['id'], r['text'], r['delay'], r['triggers'],
+            "Ha" if r['session'] else "Yo'q",
+            "Ha" if r['running'] else "Yo'q",
+            "Ha" if r['blocked'] else "Yo'q",
+        ])
+    widths = [18, 46, 15, 11, 16, 14, 12]
+    for i, w in enumerate(widths, start=1):
+        ws.column_dimensions[get_column_letter(i)].width = w
+    bio = io.BytesIO()
+    wb.save(bio)
+    bio.seek(0)
+    return bio.getvalue()
+
+def build_word_bytes(rows):
+    doc = Document()
+    doc.add_heading("Foydalanuvchilar ma'lumoti — Reply-uz", level=1)
+    doc.add_paragraph(f"Yaratilgan vaqti: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    table = doc.add_table(rows=1, cols=7)
+    table.style = "Light Grid Accent 1"
+    headers = ["ID", "Javob matni", "Kechikish (s)", "Triggerlar",
+               "Ulangan seans", "Faol jarayon", "Bloklangan"]
+    hdr = table.rows[0].cells
+    for i, h in enumerate(headers):
+        hdr[i].text = h
+        for p in hdr[i].paragraphs:
+            for run in p.runs:
+                run.bold = True
+                run.font.size = Pt(10)
+                run.font.color.rgb = RGBColor(0x30, 0x54, 0x96)
+    for r in rows:
+        cells = table.add_row().cells
+        values = [
+            str(r['id']), str(r['text']), str(r['delay']), str(r['triggers']),
+            "Ha" if r['session'] else "Yo'q",
+            "Ha" if r['running'] else "Yo'q",
+            "Ha" if r['blocked'] else "Yo'q",
+        ]
+        for i, v in enumerate(values):
+            cells[i].text = v
+            for p in cells[i].paragraphs:
+                for run in p.runs:
+                    run.font.size = Pt(9)
+    bio = io.BytesIO()
+    doc.save(bio)
+    bio.seek(0)
+    return bio.getvalue()
+
 # ========== UMUMIY JAVOB TAYYORLASH ==========
-def get_reply_text(user_id: int, incoming_text: str, is_telethon: bool = False,
-                   mark_holiday: bool = True) -> str:
-    """Avto-javob matnini tayyorlaydi (bayram, vaqt, prefiks, silent, tarjima, kirill)."""
+def get_pending_holiday_greeting(user_id: int):
+    """Bayram tabrigi hali yuborilmagan bo'lsa, uni qaytaradi. Alohida birinchi xabar sifatida yuboriladi."""
+    if not get_flag('holiday_enabled', True):
+        return None, None
+    greeting, h_name = get_holiday_info()
+    if greeting and h_name and not has_user_received_holiday(user_id, h_name):
+        return greeting, h_name
+    return None, None
+
+def get_reply_text(user_id: int, incoming_text: str, is_telethon: bool = False) -> str:
+    """Avto-javob matnini tayyorlaydi (vaqt, prefiks, silent, tarjima, kirill)."""
     my_text = get_custom_reply_text(user_id)
 
     matched = get_matching_response(user_id, incoming_text)
@@ -449,11 +556,6 @@ def get_reply_text(user_id: int, incoming_text: str, is_telethon: bool = False,
     # Prefiks
     if get_flag('time_prefix_enabled', True):
         reply = f"{get_time_based_prefix()}! {reply}"
-
-    greeting, h_name = get_holiday_info()
-    if greeting and h_name and mark_holiday and not has_user_received_holiday(user_id, h_name):
-        reply = f"{greeting}\n\n{reply}"
-        mark_holiday_greeted(user_id, h_name)
 
     tag = get_bot_tag()
     reply = f"{tag} {reply}"
@@ -473,11 +575,11 @@ def get_reply_text(user_id: int, incoming_text: str, is_telethon: bool = False,
 
 # ========== TELETHON AVTO JAVOB (faqat shaxsiy xabarlar) ==========
 async def start_auto_reply(user_id, client: TelegramClient):
-    print(f"✅ [DEBUG] start_auto_reply called for user {user_id}")
+    dlog(f"✅ start_auto_reply called for user {user_id}")
 
     @client.on(events.NewMessage(incoming=True, func=lambda e: e.is_private))
     async def auto_reply_handler(event):
-        print(f"📩 [DEBUG] Private incoming event for user {user_id}: {event.raw_text}")
+        # Shaxsiy xabarlarga avto-javob beramiz
         try:
             sender = await event.get_sender()
             # Bot hisoblarga avtojavob yubormaymiz (bot-bot loop bo'lmasin)
@@ -485,6 +587,9 @@ async def start_auto_reply(user_id, client: TelegramClient):
                 return
 
             if event.out:
+                return
+
+            if not get_flag('autoreply_enabled', True):
                 return
 
             my_text = get_custom_reply_text(user_id)
@@ -501,15 +606,25 @@ async def start_auto_reply(user_id, client: TelegramClient):
                 full_user = await client(GetFullUserRequest(event.sender_id))
                 is_online = isinstance(full_user.users[0].status, UserStatusOnline)
             except Exception as e:
-                print(f"⚠️ Online holatni tekshirishda xatolik: {e}")
+                dlog(f"⚠️ Online holatni tekshirishda xatolik: {e}")
                 is_online = False
+
+            reply = get_reply_text(user_id, event.raw_text or '', is_telethon=True)
+
+            # ------ BAYRAM TABRIGI: ALOHIDA, BIRINCHI XABAR sifatida yuboriladi ------
+            greeting, h_name = get_pending_holiday_greeting(user_id)
+            if greeting:
+                try:
+                    await client.send_message(event.chat_id, greeting)
+                    mark_holiday_greeted(user_id, h_name)
+                    dlog(f"🎉 Holiday greeting sent to {event.chat_id}")
+                except Exception as e:
+                    dlog(f"⚠️ Bayram tabrigini yuborishda xatolik: {e}")
 
             if is_online:
                 delay = get_user_delay(user_id)
-                print(f"⏳ [DEBUG] Online, waiting {delay}s")
+                dlog(f"⏳ Online, waiting {delay}s")
                 await asyncio.sleep(delay)
-
-            reply = get_reply_text(user_id, event.raw_text or '', is_telethon=True)
 
             # ------ MUHIM: JAVOB birinchi yuboriladi, so'ng "o'qilgan" qilinadi ------
             sent = await client.send_message(
@@ -517,23 +632,37 @@ async def start_auto_reply(user_id, client: TelegramClient):
                 reply_to=event.id
             )
             save_sent_reply(user_id, event.chat_id, sent.id)
-            print(f"✅ [DEBUG] Reply sent, msg id {sent.id}")
+            dlog(f"✅ Reply sent, msg id {sent.id}")
 
             # O'qilgan deb belgilash — JAVOBDAN KEYIN
-            try:
-                await client.send_read_acknowledge(event.chat_id)
-            except Exception as e:
-                print(f"⚠️ Read ack xatosi: {e}")
+            if get_flag('read_enabled', True):
+                try:
+                    await client.send_read_acknowledge(event.chat_id)
+                except Exception as e:
+                    dlog(f"⚠️ Read ack xatosi: {e}")
 
         except (AuthKeyUnregisteredError, UserDeactivatedBanError, UnauthorizedError) as e:
-            print(f"❌ [DEBUG] Auth error: {e}")
+            dlog(f"❌ Auth error: {e}")
             stop_client_task(user_id); delete_session(user_id)
         except FloodWaitError as e:
-            print(f"⏳ [DEBUG] Flood wait {e.seconds}s")
+            dlog(f"⏳ Flood wait {e.seconds}s")
             await asyncio.sleep(e.seconds)
         except Exception as e:
-            print(f"❌ [DEBUG] Handler error: {e}")
+            dlog(f"❌ Handler error: {e}")
             traceback.print_exc()
+
+    @client.on(events.NewMessage(incoming=True, func=lambda e: e.is_group))
+    async def telethon_group_reader(event):
+        # Guruhdagi xabarlarni o'qiymiz: javob YO'ZMAYMIZ, konsolga log CHIQARMAYMIZ.
+        # Faqat "o'qilgan" deb belgilaymiz (agar yoqilgan bo'lsa).
+        if event.out:
+            return
+        if not get_flag('read_enabled', True):
+            return
+        try:
+            await client.send_read_acknowledge(event.chat_id)
+        except Exception:
+            pass
 
     @client.on(events.NewMessage(outgoing=True))
     async def outgoing_handler(event):
@@ -563,7 +692,7 @@ async def start_auto_reply(user_id, client: TelegramClient):
             if msg_ids:
                 await client.delete_messages(chat_id, msg_ids)
         except Exception as e:
-            print(f"Avto-javoblarni o'chirishda xatolik: {e}")
+            dlog(f"Avto-javoblarni o'chirishda xatolik: {e}")
 
         if event.text and not event.text.startswith('.'):
             add_log_entry(user_id, event.chat_id, True, event.text)
@@ -576,17 +705,17 @@ async def start_auto_reply(user_id, client: TelegramClient):
             if msg_ids:
                 await client.delete_messages(chat_id, msg_ids)
         except Exception as e:
-            print(f"Read hodisasida xatolik: {e}")
+            dlog(f"Read hodisasida xatolik: {e}")
 
     try:
-        print(f"🔄 [DEBUG] Starting client.run_until_disconnected() for user {user_id}")
+        dlog(f"🔄 Starting client.run_until_disconnected() for user {user_id}")
         await client.run_until_disconnected()
-        print(f"🛑 [DEBUG] client.run_until_disconnected() finished for user {user_id}")
+        dlog(f"🛑 client.run_until_disconnected() finished for user {user_id}")
     except Exception as e:
-        print(f"❌ [DEBUG] client.run_until_disconnected() error: {e}")
+        dlog(f"❌ client.run_until_disconnected() error: {e}")
         traceback.print_exc()
     finally:
-        print(f"🧹 [DEBUG] Cleaning up user {user_id}")
+        dlog(f"🧹 Cleaning up user {user_id}")
         user_clients.pop(user_id, None)
         auto_tasks.pop(user_id, None)
 
@@ -788,6 +917,7 @@ ADMIN_CATEGORIES = [
     ("🛠 Boshqaruv vositalari",  "adm_cat_tools"),
     ("⚡️ Tizim",                "adm_cat_system"),
     ("🇺🇿 Til / Tarjima",        "adm_cat_lang"),
+    ("📤 Eksport (Excel/Word)",  "adm_cat_export"),
 ]
 
 # ---- har kategoriyaning funksiyalari: (label, callback) ----
@@ -859,6 +989,8 @@ CAT_SETTINGS = [
     ("📋 Filter so'zlar",            "adm_list_filter_words"),
     ("🚮 Filter so'zni o'chirish",    "adm_del_filter_word"),
     ("🧹 Barcha sozlamalarni tiklash", "adm_reset_settings"),
+    ("🎉 Bayram tabriki yoqish/o'chirish", "adm_toggle_holiday"),
+    ("🐞 Debug log yoqish/o'chirish",     "adm_toggle_debug"),
 ]
 
 CAT_HOLIDAY = [
@@ -929,6 +1061,13 @@ CAT_LANG = [
     ("🅰️ Kirill/limit auto",   "adm_toggle_cyrillic"),
 ]
 
+CAT_EXPORT = [
+    ("📊 Excel (.xlsx) yuborish",  "adm_export_xlsx"),
+    ("📄 Word (.docx) yuborish",   "adm_export_docx"),
+    ("👥 Jami foydalanuvchilar",   "adm_export_count"),
+    ("🧹 Eksport uchun tozalash",  "adm_export_cleanup"),
+]
+
 CATEGORY_ITEMS = {
     "adm_cat_stats":     CAT_STATS,
     "adm_cat_users":     CAT_USERS,
@@ -943,6 +1082,7 @@ CATEGORY_ITEMS = {
     "adm_cat_tools":     CAT_TOOLS,
     "adm_cat_system":    CAT_SYSTEM,
     "adm_cat_lang":      CAT_LANG,
+    "adm_cat_export":    CAT_EXPORT,
 }
 
 def get_admin_keyboard(page: int = 0):
@@ -1490,6 +1630,20 @@ async def adm_toggle_read_cb(callback: types.CallbackQuery):
     await callback.message.answer(f"👓 O'qilgan (read) belgilash: {'✅ Yoqilgan' if get_flag('read_enabled', True) else '❌ O\'chirilgan'}")
     await callback.answer()
 
+@dp.callback_query(F.data == "adm_toggle_holiday")
+async def adm_toggle_holiday_cb(callback: types.CallbackQuery):
+    if not is_admin(callback.from_user): await callback.answer(); return
+    set_flag('holiday_enabled', not get_flag('holiday_enabled', True))
+    await callback.message.answer(f"🎉 Bayram tabriki: {'✅ Yoqilgan' if get_flag('holiday_enabled', True) else '❌ O\'chirilgan'}")
+    await callback.answer()
+
+@dp.callback_query(F.data == "adm_toggle_debug")
+async def adm_toggle_debug_cb(callback: types.CallbackQuery):
+    if not is_admin(callback.from_user): await callback.answer(); return
+    set_flag('debug_enabled', not get_flag('debug_enabled', True))
+    await callback.message.answer(f"🐞 Debug log: {'✅ Yoqilgan' if get_flag('debug_enabled', True) else '❌ O\'chirilgan'}")
+    await callback.answer()
+
 @dp.callback_query(F.data == "adm_toggle_welcome")
 async def adm_toggle_welcome_cb(callback: types.CallbackQuery):
     if not is_admin(callback.from_user): await callback.answer(); return
@@ -1885,10 +2039,60 @@ async def adm_start_all_cb(callback: types.CallbackQuery):
     await callback.message.answer(f"▶️ {started} ta jarayon qayta ishga tushirildi.")
     await callback.answer()
 
+# ================= EKSPORT (EXCEL / WORD) =================
+@dp.callback_query(F.data == "adm_export_xlsx")
+async def adm_export_xlsx_cb(callback: types.CallbackQuery):
+    if not is_admin(callback.from_user): await callback.answer(); return
+    rows = collect_user_data()
+    if not rows:
+        await callback.message.answer("📭 Eksport uchun foydalanuvchilar mavjud emas.")
+        await callback.answer(); return
+    try:
+        data = build_excel_bytes(rows)
+        buf = BufferedInputFile(data, filename="foydalanuvchilar.xlsx")
+        await callback.message.answer_document(buf, caption=f"📊 {len(rows)} ta foydalanuvchi (Excel)")
+    except Exception as e:
+        await callback.message.answer(f"❌ Eksport xatosi: {html.escape(str(e))}")
+    await callback.answer()
+
+@dp.callback_query(F.data == "adm_export_docx")
+async def adm_export_docx_cb(callback: types.CallbackQuery):
+    if not is_admin(callback.from_user): await callback.answer(); return
+    rows = collect_user_data()
+    if not rows:
+        await callback.message.answer("📭 Eksport uchun foydalanuvchilar mavjud emas.")
+        await callback.answer(); return
+    try:
+        data = build_word_bytes(rows)
+        buf = BufferedInputFile(data, filename="foydalanuvchilar.docx")
+        await callback.message.answer_document(buf, caption=f"📄 {len(rows)} ta foydalanuvchi (Word)")
+    except Exception as e:
+        await callback.message.answer(f"❌ Eksport xatosi: {html.escape(str(e))}")
+    await callback.answer()
+
+@dp.callback_query(F.data == "adm_export_count")
+async def adm_export_count_cb(callback: types.CallbackQuery):
+    if not is_admin(callback.from_user): await callback.answer(); return
+    rows = collect_user_data()
+    await callback.message.answer(
+        f"👥 Jami foydalanuvchilar: <b>{len(rows)}</b>\n"
+        f"⚡️ Faol jarayonlar: <b>{sum(1 for r in rows if r['running'])}</b>\n"
+        f"🚫 Bloklanganlar: <b>{sum(1 for r in rows if r['blocked'])}</b>",
+        parse_mode="HTML"
+    )
+    await callback.answer()
+
+@dp.callback_query(F.data == "adm_export_cleanup")
+async def adm_export_cleanup_cb(callback: types.CallbackQuery):
+    if not is_admin(callback.from_user): await callback.answer(); return
+    set_config('debug_enabled', True)
+    await callback.message.answer("🧹 Eksport ishga tayyor. Yangi foydalanuvchi ma'lumotlari DB'dan o'qiladi.")
+    await callback.answer()
+
 def count_admin_features():
     """Jami admin funksiya (menyu + callback) sonini sanaydi."""
     menu = sum(len(v) for v in CATEGORY_ITEMS.values()) + len(ADMIN_CATEGORIES)
-    return menu + 10  # qo'shimcha xizmat funksiyalar
+    return menu + 12  # qo'shimcha xizmat funksiyalar
 
 # =======================================================================
 #                    MATN ISHLOVCHI (admin + user flow)
@@ -2114,7 +2318,7 @@ async def handle_text_input(message: types.Message):
             except ValueError:
                 await message.answer("❌ ID raqam bo'lishi kerak.")
                 return
-            demo = get_reply_text(target_id, "Assalomu alaykum", mark_holiday=False)
+            demo = get_reply_text(target_id, "Assalomu alaykum")
             await message.answer(
                 f"🧪 <b>{target_id}</b> uchun test javob:\n\n<code>{html.escape(demo)}</code>",
                 parse_mode="HTML"
