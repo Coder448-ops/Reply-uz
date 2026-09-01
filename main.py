@@ -1,210 +1,240 @@
-import os
 import asyncio
-import psycopg2
-import sys
-from aiohttp import web
+import sqlite3
+import html
+import time
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, KeyboardButton, ReplyKeyboardMarkup
 from aiogram import F
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
+from telethon.tl.functions.users import GetFullUserRequest
+from telethon.tl.types import UserStatusOnline
 from telethon.errors import (
     SessionPasswordNeededError,
-    PhoneCodeInvalidError,
-    PhoneCodeExpiredError,
     FloodWaitError,
-    PhoneNumberInvalidError,
+    AuthKeyUnregisteredError,
+    UserDeactivatedBanError,
+    UnauthorizedError
 )
-from telethon.tl.types import User
 
-DEFAULT_REPLY_TEXT = "Kechirasiz, hozircha bandman. Kelishim bilan javob beraman.\n(Avtomatik javob)"
+DB_NAME = 'user_sessions.db'
+DEFAULT_REPLY_TEXT = "Hozircha bandman, bo'shashim bilan aloqaga chiqaman."
+DEFAULT_DELAY = 7  
 
-# ========== GLOBAL SOZLAMALAR ==========
-API_ID = None
-API_HASH = None
-BOT_TOKEN = None
-DATABASE_URL = None
+# ========== SOZLAMALAR ==========
+API_ID = 37437082
+API_HASH = "b7d4fa4d28472bf3768a4cae5e3fd01c"
+BOT_TOKEN = "8995093768:AAEDCJ-yB2mxlQRhdKfLjO9VoogSM22lHdY"
 
-bot: Bot = None
+bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
 # ========== XOTIRA ==========
-user_clients = {}          # user_id -> TelegramClient
-auto_tasks = {}            # user_id -> asyncio.Task
-waiting_for = {}           # user_id -> "phone" | "code" | "password" | "custom_text" | None
-phone_cache = {}           # user_id -> phone
-phone_code_hash_cache = {} # user_id -> phone_code_hash
+user_clients = {}          
+auto_tasks = {}            
+waiting_for = {}           
+phone_cache = {}           
+phone_code_hash_cache = {} 
 
 
-# ========== ENVIRONMENT VARIABLES'DAN OLISH ==========
-def load_credentials():
-    global API_ID, API_HASH, BOT_TOKEN, DATABASE_URL
-
-    API_ID = os.getenv("API_ID")
-    API_HASH = os.getenv("API_HASH")
-    BOT_TOKEN = os.getenv("BOT_TOKEN")
-    DATABASE_URL = os.getenv("DATABASE_URL")
-
-    if not API_ID or not API_HASH or not BOT_TOKEN:
-        print("❌ XATOLIK: API_ID, API_HASH yoki BOT_TOKEN topilmadi!")
-        sys.exit(1)
-
-    if not DATABASE_URL:
-        print("❌ XATOLIK: DATABASE_URL topilmadi!")
-        sys.exit(1)
-
-    try:
-        API_ID = int(API_ID)
-    except ValueError:
-        print("❌ XATOLIK: API_ID faqat raqamlardan iborat bo'lishi kerak!")
-        sys.exit(1)
-
-    print("=" * 50)
-    print("✅ Environment Variables va DATABASE_URL yuklandi!")
-    print("=" * 50)
-
-
-# ========== POSTGRESQL FUNKSIYALARI ==========
-def get_db_connection():
-    return psycopg2.connect(DATABASE_URL)
-
+# ========== MA'LUMOTLAR BAZASI ==========
+def get_db():
+    conn = sqlite3.connect(DB_NAME, timeout=15)
+    conn.execute("PRAGMA journal_mode=WAL;")
+    return conn
 
 def init_db():
-    conn = get_db_connection()
-    c = conn.cursor()
-    c.execute('''CREATE TABLE IF NOT EXISTS user_sessions
-                 (user_id BIGINT PRIMARY KEY, session_string TEXT, custom_text TEXT)''')
-    conn.commit()
-    c.close()
-    conn.close()
-    print("🛠️ PostgreSQL bazasi va jadval tayyor qilindi.")
+    with get_db() as conn:
+        c = conn.cursor()
+        c.execute('''CREATE TABLE IF NOT EXISTS sessions
+                     (user_id INTEGER PRIMARY KEY, session_string TEXT, custom_text TEXT, delay_seconds INTEGER DEFAULT 7)''')
+        
+        c.execute('''CREATE TABLE IF NOT EXISTS custom_triggers
+                     (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, keyword TEXT, response TEXT)''')
 
+        c.execute('''CREATE TABLE IF NOT EXISTS sent_auto_replies
+                     (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, chat_id INTEGER, msg_id INTEGER)''')
+        
+        conn.commit()
 
 def save_session(user_id, session_string):
-    conn = get_db_connection()
-    c = conn.cursor()
-    c.execute('''INSERT INTO user_sessions (user_id, session_string) VALUES (%s, %s)
-                 ON CONFLICT(user_id) DO UPDATE SET session_string = EXCLUDED.session_string''', 
-              (user_id, session_string))
-    conn.commit()
-    c.close()
-    conn.close()
+    with get_db() as conn:
+        conn.execute('''INSERT INTO sessions (user_id, session_string) VALUES (?, ?)
+                     ON CONFLICT(user_id) DO UPDATE SET session_string=excluded.session_string''', 
+                  (user_id, session_string))
 
+def has_active_session(user_id):
+    with get_db() as conn:
+        c = conn.cursor()
+        c.execute('SELECT session_string FROM sessions WHERE user_id=? AND session_string IS NOT NULL', (user_id,))
+        row = c.fetchone()
+        return row is not None and bool(row[0])
 
 def set_custom_reply_text(user_id, text):
-    conn = get_db_connection()
-    c = conn.cursor()
-    c.execute('''INSERT INTO user_sessions (user_id, custom_text) VALUES (%s, %s)
-                 ON CONFLICT(user_id) DO UPDATE SET custom_text = EXCLUDED.custom_text''', 
-              (user_id, text))
-    conn.commit()
-    c.close()
-    conn.close()
-
+    with get_db() as conn:
+        conn.execute('''INSERT INTO sessions (user_id, custom_text) VALUES (?, ?)
+                     ON CONFLICT(user_id) DO UPDATE SET custom_text=excluded.custom_text''', 
+                  (user_id, text))
 
 def get_custom_reply_text(user_id):
-    conn = get_db_connection()
-    c = conn.cursor()
-    c.execute('SELECT custom_text FROM user_sessions WHERE user_id=%s', (user_id,))
-    row = c.fetchone()
-    c.close()
-    conn.close()
-    if row and row[0]:
-        return row[0]
-    return DEFAULT_REPLY_TEXT
+    with get_db() as conn:
+        c = conn.cursor()
+        c.execute('SELECT custom_text FROM sessions WHERE user_id=?', (user_id,))
+        row = c.fetchone()
+        return row[0] if row and row[0] else DEFAULT_REPLY_TEXT
 
+def set_user_delay(user_id, seconds):
+    with get_db() as conn:
+        conn.execute('''INSERT INTO sessions (user_id, delay_seconds) VALUES (?, ?)
+                     ON CONFLICT(user_id) DO UPDATE SET delay_seconds=excluded.delay_seconds''', 
+                  (user_id, seconds))
 
-def get_session(user_id):
-    conn = get_db_connection()
-    c = conn.cursor()
-    c.execute('SELECT session_string FROM user_sessions WHERE user_id=%s', (user_id,))
-    row = c.fetchone()
-    c.close()
-    conn.close()
-    return row[0] if row else None
-
+def get_user_delay(user_id):
+    with get_db() as conn:
+        c = conn.cursor()
+        c.execute('SELECT delay_seconds FROM sessions WHERE user_id=?', (user_id,))
+        row = c.fetchone()
+        return row[0] if row and row[0] is not None else DEFAULT_DELAY
 
 def get_all_sessions():
-    conn = get_db_connection()
-    c = conn.cursor()
-    c.execute('SELECT user_id, session_string FROM user_sessions WHERE session_string IS NOT NULL')
-    rows = c.fetchall()
-    c.close()
-    conn.close()
-    return rows
-
+    with get_db() as conn:
+        c = conn.cursor()
+        c.execute('SELECT user_id, session_string FROM sessions WHERE session_string IS NOT NULL')
+        return c.fetchall()
 
 def delete_session(user_id):
-    conn = get_db_connection()
-    c = conn.cursor()
-    c.execute('DELETE FROM user_sessions WHERE user_id=%s', (user_id,))
-    conn.commit()
-    c.close()
-    conn.close()
+    with get_db() as conn:
+        conn.execute('DELETE FROM sessions WHERE user_id=?', (user_id,))
+        conn.execute('DELETE FROM sent_auto_replies WHERE user_id=?', (user_id,))
+        conn.execute('DELETE FROM custom_triggers WHERE user_id=?', (user_id,))
+
+def add_custom_trigger(user_id, keyword, response):
+    with get_db() as conn:
+        conn.execute('INSERT INTO custom_triggers (user_id, keyword, response) VALUES (?, ?, ?)',
+                     (user_id, keyword.lower().strip(), response))
+
+def get_matching_response(user_id, message_text):
+    if not message_text:
+        return None
+    clean_msg = message_text.lower().strip()
+    with get_db() as conn:
+        c = conn.cursor()
+        c.execute('SELECT keyword, response FROM custom_triggers WHERE user_id=?', (user_id,))
+        triggers = c.fetchall()
+        for kw, resp in triggers:
+            if kw == clean_msg or kw in clean_msg:
+                return resp
+    return None
+
+def get_user_triggers(user_id):
+    with get_db() as conn:
+        c = conn.cursor()
+        c.execute('SELECT id, keyword, response FROM custom_triggers WHERE user_id=?', (user_id,))
+        return c.fetchall()
+
+def delete_trigger_by_id(trigger_id, user_id):
+    with get_db() as conn:
+        conn.execute('DELETE FROM custom_triggers WHERE id=? AND user_id=?', (trigger_id, user_id))
+
+def save_sent_reply(user_id, chat_id, msg_id):
+    with get_db() as conn:
+        conn.execute('INSERT INTO sent_auto_replies (user_id, chat_id, msg_id) VALUES (?, ?, ?)',
+                     (user_id, chat_id, msg_id))
+
+def get_and_delete_all_sent_replies(user_id, chat_id):
+    with get_db() as conn:
+        c = conn.cursor()
+        c.execute('SELECT msg_id FROM sent_auto_replies WHERE user_id=? AND chat_id=?', (user_id, chat_id))
+        rows = c.fetchall()
+        if rows:
+            c.execute('DELETE FROM sent_auto_replies WHERE user_id=? AND chat_id=?', (user_id, chat_id))
+            conn.commit()
+            return [r[0] for r in rows]
+        return []
 
 
-# ========== TEKSHIRUV FUNKSIYASI ==========
-def is_user_logged_in(user_id: int) -> bool:
-    """Foydalanuvchi faol klientga ega yoki bazada saqlangan sessiyasi borligini tekshiradi."""
-    if user_id in user_clients and user_clients[user_id].is_connected():
-        return True
-    session_str = get_session(user_id)
-    return bool(session_str)
-
-
-# ========== AVTOMATIK JAVOB FUNKSIYASI ==========
+# ========== TELETHON AVTO JAVOB FUNKSIYASI ==========
 async def start_auto_reply(user_id, client: TelegramClient):
+    
+    # 1. KIRUVCHI XABAR (B-USER YOZGANDA)
     @client.on(events.NewMessage(incoming=True))
     async def auto_reply_handler(event):
-        # Faqat shaxsiy chatlardan kelgan va kiruvchi xabarlar uchun
         if not event.is_private or event.out:
             return
-            
-        sender = await event.get_sender()
-        # Agar yuboruvchi bot bo'lsa yoki o'zingiz bo'lsangiz e'tiborsiz qoldiramiz
-        if not isinstance(sender, User) or sender.bot or sender.is_self:
-            return
-
-        chat_id = event.chat_id
-        incoming_msg_id = event.id
-
-        # 7 soniya kutamiz (foydalanuvchi o'zi javob yozishi uchun)
-        await asyncio.sleep(7)
 
         try:
-            # 7 soniyadan keyin chatdagi eng so'nggi xabarlarni olamiz
-            messages = await client.get_messages(chat_id, limit=5)
-            
-            # Agar siz (akkaunt egasi) 7 soniya ichida javob yozgan bo'lsangiz — to'xtaymiz
-            for msg in messages:
-                if msg.out and msg.id > incoming_msg_id:
-                    print(f"ℹ️ {sender.first_name} ga o'zingiz javob yozdingiz, avto-javob bekor qilindi.")
-                    return
+            sender = await event.get_sender()
+            if not sender or getattr(sender, 'bot', False):
+                return
 
-            # Shaxsiy javob matnini olamiz
-            reply_text = get_custom_reply_text(user_id)
+            full_user = await client(GetFullUserRequest(event.sender_id))
+            is_online = isinstance(full_user.users[0].status, UserStatusOnline)
 
-            # Javob yuboramiz
-            await event.reply(reply_text)
-            print(f"📩 Avtomatik javob yuborildi: {sender.first_name}")
+            if is_online:
+                delay = get_user_delay(user_id)
+                await asyncio.sleep(delay)
 
+            matched_resp = get_matching_response(user_id, event.raw_text)
+            if matched_resp:
+                reply_text = matched_resp
+            else:
+                reply_text = get_custom_reply_text(user_id)
+
+            sent_msg = await event.reply(reply_text)
+            save_sent_reply(user_id, event.chat_id, sent_msg.id)
+
+        except (AuthKeyUnregisteredError, UserDeactivatedBanError, UnauthorizedError):
+            stop_client_task(user_id)
+            delete_session(user_id)
+        except FloodWaitError as e:
+            await asyncio.sleep(e.seconds)
         except Exception as e:
-            print(f"❌ Xatolik (auto reply): {e}")
+            print(f"Xatolik auto reply (user={user_id}): {e}")
 
-    try:
-        if not client.is_connected():
-            await client.connect()
-        print(f"✅ User {user_id} uchun auto reply ishga tushdi.")
-        await client.run_until_disconnected()
-    except asyncio.CancelledError:
-        pass
-    except Exception as e:
-        print(f"❌ Auto reply to‘xtadi (xato): {e}")
-    finally:
-        print(f"ℹ️ User {user_id} uchun auto reply tugatildi.")
-        user_clients.pop(user_id, None)
-        auto_tasks.pop(user_id, None)
+    # 2. CHIQUVCHI XABAR (A-USER JAVOB YOZSA O'CHIRISH)
+    @client.on(events.NewMessage(outgoing=True))
+    async def outgoing_handler(event):
+        if not event.is_private:
+            return
+
+        try:
+            chat_id = event.chat_id
+            msg_ids = get_and_delete_all_sent_replies(user_id, chat_id)
+            if msg_ids:
+                await client.delete_messages(chat_id, msg_ids)
+        except Exception as e:
+            print(f"Avto-javoblarni o'chirishda xatolik: {e}")
+
+    # 3. XABAR O'QILGANIDA (READED) O'CHIRISH
+    @client.on(events.MessageRead(out=False))
+    async def message_read_handler(event):
+        try:
+            chat_id = event.chat_id
+            msg_ids = get_and_delete_all_sent_replies(user_id, chat_id)
+            if msg_ids:
+                await client.delete_messages(chat_id, msg_ids)
+        except Exception as e:
+            print(f"Read hodisasida avto-javoblarni o'chirishda xatolik: {e}")
+
+    # Auto-Reconnect sikli
+    while True:
+        try:
+            if not client.is_connected():
+                await client.connect()
+            await client.run_until_disconnected()
+            break
+        except (AuthKeyUnregisteredError, UserDeactivatedBanError, UnauthorizedError):
+            delete_session(user_id)
+            break
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            print(f"Ulanish uzildi ({user_id}), 5s keyin qayta ulanadi: {e}")
+            await asyncio.sleep(5)
+    
+    user_clients.pop(user_id, None)
+    auto_tasks.pop(user_id, None)
 
 
 def stop_client_task(user_id):
@@ -221,62 +251,104 @@ def stop_client_task(user_id):
     auto_tasks.pop(user_id, None)
 
 
-# ========== BOT BUYRUQLARI ==========
+# ========== TUGMALAR VA BOT MENU ==========
 def get_main_keyboard(is_connected=False):
     buttons = []
     if is_connected:
-        buttons.append([InlineKeyboardButton(text="✏️ Avto-javob matnini o'zgartirish", callback_data="change_text")])
+        buttons.append([InlineKeyboardButton(text="➕ So'rov/Javob qo'shish (Kalit so'z)", callback_data="add_trigger")])
+        buttons.append([InlineKeyboardButton(text="📋 Barcha so'rovlarni ko'rish", callback_data="list_triggers")])
+        buttons.append([InlineKeyboardButton(text="✏️ Asosiy javobni o'zgartirish", callback_data="change_text")])
+        buttons.append([InlineKeyboardButton(text="⏱ Kutiladigan vaqtni o'zgartirish", callback_data="change_delay")])
         buttons.append([InlineKeyboardButton(text="⏹ Avto-javobni to'xtatish", callback_data="stop_auto")])
     else:
+        # ENDI KIRAYOTGAN BO'LSA FAQAT ULANISH TUGMASI CHIQADI!
         buttons.append([InlineKeyboardButton(text="🚀 Boshlash (Ulanish)", callback_data="start_auto")])
-        buttons.append([InlineKeyboardButton(text="✏️ Avto-javob matnini o'zgartirish", callback_data="change_text")])
-    
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
 @dp.message(Command("start"))
 async def start_cmd(message: types.Message):
     user_id = message.from_user.id
-    logged_in = is_user_logged_in(user_id)
-    current_text = get_custom_reply_text(user_id)
+    
+    # Bazada va xotirada tekshiramiz
+    is_connected = has_active_session(user_id)
 
-    if logged_in and user_id not in user_clients:
-        session_string = get_session(user_id)
-        if session_string:
-            try:
-                client = TelegramClient(StringSession(session_string), API_ID, API_HASH)
-                await client.connect()
-                if await client.is_user_authorized():
-                    user_clients[user_id] = client
-                    auto_tasks[user_id] = asyncio.create_task(start_auto_reply(user_id, client))
-                else:
-                    delete_session(user_id)
-                    logged_in = False
-            except Exception:
-                logged_in = False
+    if is_connected:
+        current_text = get_custom_reply_text(user_id)
+        current_delay = get_user_delay(user_id)
+        safe_text = html.escape(current_text)
+        
+        await message.answer(
+            f"Assalomu alaykum! 👋\n\n"
+            f"💬 <b>Asosiy avto-javob matningiz:</b>\n<code>{safe_text}</code>\n\n"
+            f"⏱ <b>Online kutiladigan vaqt:</b> <code>{current_delay} soniya</code>\n\n"
+            f"Kerakli bo'limni tanlang:",
+            parse_mode="HTML",
+            reply_markup=get_main_keyboard(True)
+        )
+    else:
+        await message.answer(
+            "Assalomu alaykum! 👋\n\n"
+            "Botdan foydalanish uchun Telegram akkauntingizni ulang.",
+            reply_markup=get_main_keyboard(False)
+        )
 
-    status_text = "🟢 **Avto-javob faol holatda**" if logged_in else "🔴 **Avto-javob ulanmagan**"
 
-    await message.answer(
-        f"Assalomu alaykum! 👋\n\n"
-        f"Holat: {status_text}\n"
-        f"💬 **Sizning joriy avto-javob matningiz:**\n`{current_text}`\n\n"
-        f"Kerakli bo'limni tanlang:",
-        parse_mode="Markdown",
-        reply_markup=get_main_keyboard(logged_in)
+@dp.callback_query(F.data == "add_trigger")
+async def add_trigger_cb(callback: types.CallbackQuery):
+    user_id = callback.from_user.id
+    waiting_for[user_id] = "trigger_keyword"
+    await callback.message.answer(
+        "🔹 **Qaysi kichik gap/so'z yozilganda javob berilsin?**\n\n"
+        "Masalan: `salom` yoki `qayerdasiz`",
+        parse_mode="Markdown"
     )
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "list_triggers")
+async def list_triggers_cb(callback: types.CallbackQuery):
+    user_id = callback.from_user.id
+    triggers = get_user_triggers(user_id)
+    
+    if not triggers:
+        await callback.message.answer("📭 Siz hali hech qanday maxsus so'rov qo'shmadingiz.")
+        await callback.answer()
+        return
+
+    msg = "📋 **Siz qo'shgan maxsus so'rovlar:**\n\n"
+    buttons = []
+    for t_id, kw, resp in triggers:
+        msg += f"🔸 **So'rov:** `{kw}` ➡️ **Javob:** `{resp}`\n"
+        buttons.append([InlineKeyboardButton(text=f"❌ O'chirish: {kw}", callback_data=f"del_trg_{t_id}")])
+
+    kb = InlineKeyboardMarkup(inline_keyboard=buttons)
+    await callback.message.answer(msg, parse_mode="Markdown", reply_markup=kb)
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("del_trg_"))
+async def delete_trigger_cb(callback: types.CallbackQuery):
+    user_id = callback.from_user.id
+    t_id = int(callback.data.split("_")[2])
+    delete_trigger_by_id(t_id, user_id)
+    await callback.message.answer("✅ Maxsus so'rov o'chirib tashlandi.")
+    await callback.answer()
 
 
 @dp.callback_query(F.data == "change_text")
 async def change_text_callback(callback: types.CallbackQuery):
     user_id = callback.from_user.id
     waiting_for[user_id] = "custom_text"
-    
-    await callback.message.answer(
-        "📝 Yangi avto-javob matningizni yozib yuboring:\n\n"
-        "*(Masalan: Hozir bandman, tez orada javob beraman!)*",
-        parse_mode="Markdown"
-    )
+    await callback.message.answer("📝 Yangi asosiy avto-javob matnini kiriting:")
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "change_delay")
+async def change_delay_callback(callback: types.CallbackQuery):
+    user_id = callback.from_user.id
+    waiting_for[user_id] = "custom_delay"
+    await callback.message.answer("⏱ Online bo'lganda necha soniyadan keyin javob qaytarilsin? (Faqat raqam):")
     await callback.answer()
 
 
@@ -284,39 +356,18 @@ async def change_text_callback(callback: types.CallbackQuery):
 async def start_auto_callback(callback: types.CallbackQuery):
     user_id = callback.from_user.id
 
-    session_string = get_session(user_id)
-    if session_string:
-        try:
-            if user_id not in user_clients or not user_clients[user_id].is_connected():
-                client = TelegramClient(StringSession(session_string), API_ID, API_HASH)
-                await client.connect()
-                if await client.is_user_authorized():
-                    user_clients[user_id] = client
-                    auto_tasks[user_id] = asyncio.create_task(start_auto_reply(user_id, client))
-            
-            await callback.message.edit_text(
-                "✅ Siz allaqachon ro'yxatdan o'tgansiz va avto-javob faollashtirildi!",
-                reply_markup=get_main_keyboard(True)
-            )
-            await callback.answer()
-            return
-        except Exception:
-            delete_session(user_id)
+    if has_active_session(user_id):
+        await callback.message.edit_text("✅ Siz allaqachon ulangansiz.", reply_markup=get_main_keyboard(True))
+        await callback.answer()
+        return
 
     keyboard = ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text="📱 Telefon raqamini ulashish", request_contact=True)]
-        ],
+        keyboard=[[KeyboardButton(text="📱 Telefon raqamini ulashish", request_contact=True)]],
         resize_keyboard=True,
         one_time_keyboard=True
     )
-    await callback.message.edit_text(
-        "📱 Iltimos, quyidagi tugma orqali telefon raqamingizni ulashing."
-    )
-    await callback.message.answer(
-        "👇 Tugmani bosing:",
-        reply_markup=keyboard
-    )
+    await callback.message.edit_text("📱 Telefon raqamingizni ulashing.")
+    await callback.message.answer("👇 Tugmani bosing:", reply_markup=keyboard)
     waiting_for[user_id] = "phone"
     await callback.answer()
 
@@ -333,40 +384,27 @@ async def request_code(user_id: int, phone: str, message: types.Message):
         waiting_for[user_id] = "code"
         
         await message.answer(
-            "✅ Kod yuborildi!\n\n"
-            "⚠️ **MUHIM:** Kodni quyidagi formatda yuboring:\n"
-            "👉 `(1-2-3-4-5)` masalan kod `51996` bo'lsa `5-1-9-9-6` deb yuboring.",
-            parse_mode="Markdown",
+            "✅ Kod yuborildi!\n\n⚠️ Kodni ajratib yuboring (Masalan: <code>5-1-9-9-6</code>).",
+            parse_mode="HTML",
             reply_markup=types.ReplyKeyboardRemove()
         )
     except FloodWaitError as e:
-        await message.answer(f"⏳ Juda ko'p urinish. {e.seconds} soniyadan keyin urinib ko'ring.")
-        waiting_for[user_id] = "phone"
-    except PhoneNumberInvalidError:
-        await message.answer("❌ Telefon raqam noto'g'ri. Qaytadan kiriting (+998901234567).")
+        await message.answer(f"⏳ Telegram cheklovi! Biroz kuting: {e.seconds} soniya.")
         waiting_for[user_id] = "phone"
     except Exception as e:
-        await message.answer(f"❌ Xatolik: {e}. Iltimos, to'g'ri raqam kiriting.")
+        await message.answer(f"❌ Xatolik: {html.escape(str(e))}")
         waiting_for[user_id] = "phone"
 
 
 @dp.message(F.contact)
 async def handle_contact(message: types.Message):
     user_id = message.from_user.id
-    contact = message.contact
-
     if waiting_for.get(user_id) != "phone":
-        await message.answer("❌ Iltimos, avval /start bosing va 'Boshlash' tugmasini bosing.")
+        await message.answer("❌ /start bosing.")
         return
-
-    phone = contact.phone_number
-    if not phone:
-        await message.answer("❌ Telefon raqam topilmadi.")
-        return
-
+    phone = message.contact.phone_number
     if not phone.startswith('+'):
         phone = '+' + phone
-
     await request_code(user_id, phone, message)
 
 
@@ -376,98 +414,97 @@ async def handle_text_input(message: types.Message):
     text = message.text
     state = waiting_for.get(user_id)
 
-    if state == "custom_text":
-        set_custom_reply_text(user_id, text)
+    if state == "trigger_keyword":
+        waiting_for[user_id] = f"trigger_response:{text.strip()}"
+        await message.answer(f"🔹 **'{text.strip()}'** so'zi yozilganda bot qanday javob qaytarsin?", parse_mode="Markdown")
+        return
+
+    elif state and state.startswith("trigger_response:"):
+        keyword = state.split(":", 1)[1]
+        add_custom_trigger(user_id, keyword, text.strip())
         waiting_for[user_id] = None
-        logged_in = is_user_logged_in(user_id)
+        is_connected = has_active_session(user_id)
         await message.answer(
-            f"✅ **Sizning shaxsiy avto-javob matningiz saqlandi!**\n\n"
-            f"📝 **Yangi matn:**\n`{text}`",
+            f"✅ Saqlandi!\n\n🔸 **So'rov:** `{keyword}`\n🔹 **Javob:** `{text.strip()}`",
             parse_mode="Markdown",
-            reply_markup=get_main_keyboard(logged_in)
+            reply_markup=get_main_keyboard(is_connected)
         )
         return
 
-    if is_user_logged_in(user_id) and state is None:
-        await message.answer("✅ Siz allaqachon ulangansiz.", reply_markup=get_main_keyboard(True))
+    elif state == "custom_text":
+        set_custom_reply_text(user_id, text)
+        waiting_for[user_id] = None
+        is_connected = has_active_session(user_id)
+        await message.answer(f"✅ Asosiy javob saqlandi:\n<code>{html.escape(text)}</code>", parse_mode="HTML", reply_markup=get_main_keyboard(is_connected))
+        return
+
+    elif state == "custom_delay":
+        if text.strip().isdigit():
+            sec = int(text.strip())
+            if sec < 1:
+                await message.answer("❌ Kamida 1 soniya kiritishingiz kerak.")
+                return
+            set_user_delay(user_id, sec)
+            waiting_for[user_id] = None
+            is_connected = has_active_session(user_id)
+            await message.answer(f"✅ Kutiladigan vaqt <b>{sec} soniya</b> qilib belgilandi!", parse_mode="HTML", reply_markup=get_main_keyboard(is_connected))
+        else:
+            await message.answer("❌ Faqat raqam kiriting.")
         return
 
     if state == "phone":
         clean_text = text.strip()
-        if clean_text.startswith('+') and clean_text[1:].replace(' ', '').isdigit():
+        if clean_text.startswith('+'):
             await request_code(user_id, clean_text, message)
         else:
-            await message.answer("❌ Noto'g'ri format. Iltimos, +998901234567 ko'rinishida kiriting.")
+            await message.answer("❌ Raqamni +998... shaklida kiriting.")
 
     elif state == "code":
         client = user_clients.get(user_id)
         if not client:
-            await message.answer("❌ Xatolik yuz berdi. Iltimos, /start bosing.")
-            waiting_for[user_id] = None
+            await message.answer("❌ Xatolik. /start bosing.")
             return
 
-        clean_code = (
-            text.replace(' ', '')
-            .replace('-', '')
-            .replace('(', '')
-            .replace(')', '')
-            .replace('.', '')
-            .strip()
-        )
+        clean_code = text.replace('-', '').replace(' ', '').strip()
         phone = phone_cache.get(user_id)
         phone_code_hash = phone_code_hash_cache.get(user_id)
 
         try:
             await client.sign_in(phone=phone, code=clean_code, phone_code_hash=phone_code_hash)
             await finish_login(user_id, client, message)
-
         except SessionPasswordNeededError:
             waiting_for[user_id] = "password"
-            await message.answer("🔐 Sizda 2-bosqichli parol yoqilgan. Parolingizni kiriting:")
-
-        except (PhoneCodeInvalidError, PhoneCodeExpiredError):
-            await message.answer("❌ Kod noto'g'ri yoki muddati o'tgan. Qaytadan /start bosing.")
-            await client.disconnect()
-            user_clients.pop(user_id, None)
-            phone_code_hash_cache.pop(user_id, None)
-            waiting_for[user_id] = "phone"
-
+            await message.answer("🔐 2-bosqichli parolingizni kiriting:")
         except Exception as e:
-            await message.answer(f"❌ Xatolik: {e}. Qaytadan /start bosing.")
-            await client.disconnect()
-            user_clients.pop(user_id, None)
-            phone_code_hash_cache.pop(user_id, None)
-            waiting_for[user_id] = "phone"
+            await message.answer(f"❌ Kod noto'g'ri: {html.escape(str(e))}")
 
     elif state == "password":
         client = user_clients.get(user_id)
         if not client:
-            await message.answer("❌ Xatolik yuz berdi. Iltimos, /start bosing.")
-            waiting_for[user_id] = None
             return
         try:
             await client.sign_in(password=text)
             await finish_login(user_id, client, message)
         except Exception as e:
-            await message.answer(f"❌ Parol noto'g'ri: {e}. Qaytadan kiriting.")
-
-    else:
-        await message.answer("❌ Iltimos, avval /start bosing.", reply_markup=get_main_keyboard(is_user_logged_in(user_id)))
+            await message.answer(f"❌ Parol noto'g'ri: {html.escape(str(e))}")
 
 
 async def finish_login(user_id: int, client: TelegramClient, message: types.Message):
+    stop_client_task(user_id)
     session_string = client.session.save()
     save_session(user_id, session_string)
+    
     waiting_for[user_id] = None
     phone_cache.pop(user_id, None)
     phone_code_hash_cache.pop(user_id, None)
 
     task = asyncio.create_task(start_auto_reply(user_id, client))
+    user_clients[user_id] = client
     auto_tasks[user_id] = task
 
+    delay = get_user_delay(user_id)
     await message.answer(
-        "✅ Muvaffaqiyatli ulandi!\n"
-        "🤖 Endi 7 soniya ichida o'qilmagan va javob berilmagan xabarlarga avtomatik javob beriladi.",
+        f"✅ Muvaffaqiyatli ulandi!\n🤖 Offline bo'lsangiz darhol, Online bo'lsangiz {delay} soniyada avto-javob yuboriladi va o'qilganida/javob berilganida o'chiriladi.",
         reply_markup=get_main_keyboard(True)
     )
 
@@ -475,20 +512,17 @@ async def finish_login(user_id: int, client: TelegramClient, message: types.Mess
 @dp.callback_query(F.data == "stop_auto")
 async def stop_auto_callback(callback: types.CallbackQuery):
     user_id = callback.from_user.id
-
-    if is_user_logged_in(user_id):
-        stop_client_task(user_id)
-        delete_session(user_id)
-        waiting_for[user_id] = None
-        await callback.message.edit_text("✅ Avtomatik javob to'xtatildi va sessiya o'chirildi.", reply_markup=get_main_keyboard(False))
-    else:
-        await callback.message.edit_text("❌ Siz hali ulanmagansiz.", reply_markup=get_main_keyboard(False))
+    stop_client_task(user_id)
+    delete_session(user_id)
+    waiting_for[user_id] = None
+    await callback.message.edit_text("✅ Avto-javob to'xtatildi.", reply_markup=get_main_keyboard(False))
     await callback.answer()
 
 
-# ========== SAQLANGAN SESSIYALARNI TIKLASH ==========
+# ========== RESTART VAQTI TIKLASH ==========
 async def restore_sessions():
-    for user_id, session_string in get_all_sessions():
+    sessions = get_all_sessions()
+    for user_id, session_string in sessions:
         try:
             client = TelegramClient(StringSession(session_string), API_ID, API_HASH)
             await client.connect()
@@ -496,54 +530,21 @@ async def restore_sessions():
                 user_clients[user_id] = client
                 task = asyncio.create_task(start_auto_reply(user_id, client))
                 auto_tasks[user_id] = task
-                print(f"🔄 User {user_id} sessiyasi PostgreSQL'dan tiklandi.")
             else:
                 await client.disconnect()
                 delete_session(user_id)
-                print(f"⚠️ User {user_id} sessiyasi yaroqsiz, o'chirildi.")
-        except Exception as e:
-            print(f"❌ Sessiyani tiklashda xato (user {user_id}): {e}")
+        except (AuthKeyUnregisteredError, UserDeactivatedBanError, UnauthorizedError):
             delete_session(user_id)
+        except Exception as e:
+            print(f"Restore error user {user_id}: {e}")
+        
+        await asyncio.sleep(0.2)
 
 
-# ========== BACK4APP HEALTH-CHECK SERVER ==========
-async def handle_health_check(request):
-    return web.Response(text="Bot is running and healthy!", status=200)
-
-
-# ========== BOTNI ISHGA TUSHIRISH ==========
 async def main():
-    global bot
-
-    load_credentials()
-
-    bot = Bot(token=BOT_TOKEN)
-
-    try:
-        bot_info = await bot.get_me()
-        print(f"✅ Bot muvaffaqiyatli ulandi: @{bot_info.username}")
-    except Exception as e:
-        print(f"❌ BOT_TOKEN noto'g'ri yoki xatolik: {e}")
-        sys.exit(1)
-
     init_db()
     await restore_sessions()
-
-    # Back4App taqdim etgan PORT o'zgaruvchisini olish (sukut bo'yicha 5000)
-    port = int(os.getenv("PORT", 5000))
-    
-    # Back4App Health Check uchun mini aiohttp server
-    app = web.Application()
-    app.router.add_get('/', handle_health_check)
-    app.router.add_get('/health', handle_health_check)
-    
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, '0.0.0.0', port)
-    await site.start()
-    print(f"🌐 Back4App Health-check server {port}-portda tinglamoqda...")
-
-    print("🤖 Bot polling rejimida ishga tushdi...")
+    print("🤖 Bot to'liq tayyor!")
     await dp.start_polling(bot)
 
 
@@ -551,4 +552,4 @@ if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        print("\n🛑 Bot to'xtatildi.")
+        print("To'xtatildi.")
