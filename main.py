@@ -36,8 +36,8 @@ bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
 # ========== XOTIRA ==========
-user_clients = {}          
-auto_tasks = {}            
+user_clients = {}         
+auto_tasks = {}           
 waiting_for = {}           
 phone_cache = {}           
 phone_code_hash_cache = {} 
@@ -165,7 +165,7 @@ def get_and_delete_all_sent_replies(user_id, chat_id):
         return []
 
 def is_admin(user: types.User) -> bool:
-    if user.username and user.username.lower() == ADMIN_USERNAME:
+    if user.username and user.username.lower() == ADMIN_USERNAME.lower():
         return True
     return False
 
@@ -240,23 +240,17 @@ async def start_auto_reply(user_id, client: TelegramClient):
         except Exception as e:
             print(f"Read hodisasida avto-javoblarni o'chirishda xatolik: {e}")
 
-    while True:
-        try:
-            if not client.is_connected():
-                await client.connect()
-            await client.run_until_disconnected()
-            break
-        except (AuthKeyUnregisteredError, UserDeactivatedBanError, UnauthorizedError):
-            delete_session(user_id)
-            break
-        except asyncio.CancelledError:
-            break
-        except Exception as e:
-            print(f"Ulanish uzildi ({user_id}), 5s keyin qayta ulanadi: {e}")
-            await asyncio.sleep(5)
-    
-    user_clients.pop(user_id, None)
-    auto_tasks.pop(user_id, None)
+    try:
+        await client.run_until_disconnected()
+    except asyncio.CancelledError:
+        pass
+    except (AuthKeyUnregisteredError, UserDeactivatedBanError, UnauthorizedError):
+        delete_session(user_id)
+    except Exception as e:
+        print(f"Ulanishda kutilmagan xato (user={user_id}): {e}")
+    finally:
+        user_clients.pop(user_id, None)
+        auto_tasks.pop(user_id, None)
 
 
 def stop_client_task(user_id):
