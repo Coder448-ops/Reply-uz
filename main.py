@@ -30,7 +30,7 @@ DEFAULT_DELAY = 7
 ADMIN_USERNAME = "neopulse_uz"
 API_ID = 37437082
 API_HASH = "b7d4fa4d28472bf3768a4cae5e3fd01c"
-BOT_TOKEN = "8995093768:AAEDCJ-yB2mxlQRhdKfLjO9VoogSM22lHdY"
+BOT_TOKEN = "8995093768:AAFe3bNqPLbaNwynNRNMMhTiXUk_YCi7b9s"
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
@@ -182,6 +182,17 @@ async def start_auto_reply(user_id, client: TelegramClient):
             if not sender or getattr(sender, 'bot', False):
                 return
 
+            # --- CHEKSIZ SIKL (LOOP) NING OLDINI OLISH FILTRI ---
+            my_custom_text = get_custom_reply_text(user_id)
+            if event.raw_text and event.raw_text.strip() == my_custom_text.strip():
+                return
+
+            all_triggers = get_user_triggers(user_id)
+            for _, _, resp_text in all_triggers:
+                if event.raw_text and event.raw_text.strip() == resp_text.strip():
+                    return
+            # --------------------------------------------------
+
             full_user = await client(GetFullUserRequest(event.sender_id))
             is_online = isinstance(full_user.users[0].status, UserStatusOnline)
 
@@ -193,7 +204,7 @@ async def start_auto_reply(user_id, client: TelegramClient):
             if matched_resp:
                 reply_text = matched_resp
             else:
-                reply_text = get_custom_reply_text(user_id)
+                reply_text = my_custom_text
 
             sent_msg = await event.reply(reply_text)
             save_sent_reply(user_id, event.chat_id, sent_msg.id)
