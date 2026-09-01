@@ -269,7 +269,6 @@ def get_main_keyboard(is_connected=False):
 async def start_cmd(message: types.Message):
     user_id = message.from_user.id
     
-    # Bazada va xotirada tekshiramiz
     is_connected = has_active_session(user_id)
 
     if is_connected:
@@ -543,6 +542,10 @@ async def restore_sessions():
 async def main():
     init_db()
     await restore_sessions()
+    
+    # Back4app va Telegram serveridagi eski ulanishlarni to'zalash
+    await bot.delete_webhook(drop_pending_updates=True)
+    
     print("🤖 Bot to'liq tayyor!")
     await dp.start_polling(bot)
 
