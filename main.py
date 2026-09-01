@@ -261,7 +261,6 @@ def get_main_keyboard(is_connected=False):
         buttons.append([InlineKeyboardButton(text="⏱ Kutiladigan vaqtni o'zgartirish", callback_data="change_delay")])
         buttons.append([InlineKeyboardButton(text="⏹ Avto-javobni to'xtatish", callback_data="stop_auto")])
     else:
-        # ENDI KIRAYOTGAN BO'LSA FAQAT ULANISH TUGMASI CHIQADI!
         buttons.append([InlineKeyboardButton(text="🚀 Boshlash (Ulanish)", callback_data="start_auto")])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
